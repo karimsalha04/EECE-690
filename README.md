@@ -25,21 +25,15 @@ from sklearn.metrics import (
     log_loss,
 )
 
-# ============================================================
 # 1. CONFIG
-# ============================================================
 DATA_PATH = r"C:\Users\Karim Salha\Desktop\Masters\Fall 2026\EECE 690\MLdataset\fault_dataset.xlsx"
 RANDOM_STATE = 42
 
-# ============================================================
 # 2. LOAD DATA
-# ============================================================
 df = pd.read_excel(DATA_PATH, keep_default_na=False)
 df["fault_type"] = df["fault_type"].astype(str)
 
-# ============================================================
 # 3. GROUPED SPLIT BY Case_ID  (75 / 10 / 15)
-# ============================================================
 case_df = (
     df.groupby("Case_ID", as_index=False)
       .agg(case_label=("fault_type", lambda s: next((x for x in s if x != "None"), "None")))
@@ -56,9 +50,7 @@ train_df = df[df["Case_ID"].isin(train_cases["Case_ID"])].copy()
 val_df   = df[df["Case_ID"].isin(val_cases["Case_ID"])].copy()
 test_df  = df[df["Case_ID"].isin(test_cases["Case_ID"])].copy() # UNTOUCHED
 
-# ============================================================
 # 4. FEATURES (Phase Raw quantities)
-# ============================================================
 line_features = ["Length_km", "R1_pu", "X1_pu", "R0_pu", "X0_pu"]
 
 phasor_features = []
@@ -75,9 +67,7 @@ y_train_cls = train_df["fault_type"]
 X_val_cls = val_df[features]
 y_val_cls = val_df["fault_type"]
 
-# ============================================================
 # 5. PLOT LOSS VS ITERATIONS (Convergence Plot)
-# ============================================================
 print("\n" + "=" * 70)
 print("GENERATING CONVERGENCE PLOT (CROSS-ENTROPY LOSS VS ITERATIONS)")
 print("=" * 70)
@@ -117,9 +107,7 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# ============================================================
 # 6. TRAIN FINAL MULTINOMIAL LOGISTIC REGRESSION
-# ============================================================
 clf = Pipeline([
     ("scaler", StandardScaler()),
     ("logreg", LogisticRegression(
@@ -142,9 +130,7 @@ print(pd.DataFrame(cm_val, index=labels, columns=labels))
 print("\nValidation classification report:")
 print(classification_report(y_val_cls, y_val_pred, labels=labels, zero_division=0))
 
-# ============================================================
 # 7. LINEAR REGRESSION FOR LOCATION (ACTUAL FAULTS)
-# ============================================================
 train_fault = train_df[train_df["is_faulted"] == 1].copy()
 val_fault   = val_df[val_df["is_faulted"] == 1].copy()
 
@@ -165,9 +151,7 @@ print("=" * 70)
 print(f"Mean absolute error: {abs_err_val.mean():.3f} %")
 print(f"Max absolute error:  {abs_err_val.max():.3f} %")
 
-# ============================================================
 # 8. END-TO-END VALIDATION (classifier -> regression)
-# ============================================================
 val_pred_df = val_df.copy()
 val_pred_df["pred_fault_type"] = clf.predict(val_pred_df[features])
 val_pred_df["pred_location_percent"] = np.nan
@@ -198,9 +182,7 @@ if detected_actual.any():
 else:
     print("No actual faults were detected as faults.")
 
-# ============================================================
 # 9. C TUNING FOR LOGISTIC REGRESSION
-# ============================================================
 print("\n" + "=" * 70)
 print("C TUNING FOR LOGISTIC REGRESSION (VALIDATION MACRO F1)")
 print("=" * 70)
