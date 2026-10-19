@@ -1,0 +1,607 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# 1. OUTPUT SETTINGS
+
+OUTPUT_DIR   = r"C:\Users\Karim Salha\Desktop\Masters\Fall 2026\EECE 690\MLdataset"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# 2. DATASET SIZE
+N_CASES_PER_FAULT = 400
+N_NOFAULT_CASES   = 6000
+
+TEST_MODE  = False # a test mode was created just to test the network before doing the whole simulation
+TEST_CASES = 5
+
+RANDOM_SEED = 20260913
+rng = np.random.default_rng(RANDOM_SEED)
+
+
+# 3. BASE QUANTITIES
+
+BASE_VOLTAGE_KV = 230.0
+BASE_VOLTAGE_V  = BASE_VOLTAGE_KV * 1e3
+BASE_POWER_MVA  = 100.0
+BASE_POWER_VA   = BASE_POWER_MVA * 1e6
+FREQUENCY       = 50.0
+OMEGA           = 2.0 * np.pi * FREQUENCY
+
+V_PHASE      = BASE_VOLTAGE_V / np.sqrt(3.0)
+V_BASE_PHASE = V_PHASE
+I_BASE       = BASE_POWER_VA / (np.sqrt(3.0) * BASE_VOLTAGE_V)
+Z_BASE       = BASE_VOLTAGE_V**2 / BASE_POWER_VA
+
+# 4. NOMINAL LINE PARAMETERS
+
+R1_NOM, X1_NOM, C1_NOM = 0.030, 0.300, 0.012   # ohm/km, ohm/km, uF/km
+R0_NOM, X0_NOM, C0_NOM = 0.100, 0.900, 0.007
+
+
+# 5. TOPOLOGY
+
+
+LINE_LENGTHS = {"TL1": 175.0, "TL2": 175.0, "TL3": 100.0}
+LINE_CONNECTIONS = {
+    "TL1": ("B1", "B3"),
+    "TL2": ("B1", "B2"),
+    "TL3": ("B3", "B2"),
+}
+
+
+# 6. GENERATORS (NOMINAL / BASE VALUES)
+
+G1_SSC_MVA, G1_XR, G1_ANGLE_DEG = 5000.0, 10.0,  0.0
+G2_SSC_MVA, G2_XR, G2_ANGLE_DEG = 4000.0,  8.0, -2.0
+
+
+# 7. LOAD
+
+B3_P_MW, B3_Q_MVAR = 100.0, 30.0
+
+# 8. FAULT TYPES
+
+FAULT_TYPES = ["LG", "LL", "LLG", "LLL", "LLLG"]
+
+
+# 9. TIME
+
+
+PREFAULT_TIME   = 2.0 / FREQUENCY
+SIMULATION_TIME = 0.10
+N_SAMPLES       = 501
+TIME            = np.linspace(0.0, SIMULATION_TIME, N_SAMPLES)
+
+
+# 10. SEQUENCE TRANSFORM (transforming phase quantities into sequence)
+
+a = np.exp(1j * 2.0 * np.pi / 3.0)
+SEQ_TO_PHASE = np.array([[1, 1, 1],
+                         [1, a**2, a],
+                         [1, a, a**2]], dtype=complex)
+PHASE_TO_SEQ = np.linalg.inv(SEQ_TO_PHASE)
+
+def abc_to_seq(abc):
+    return PHASE_TO_SEQ @ np.asarray(abc, dtype=complex)
+
+# 11. PERTURBATION / SAMPLING HELPERS
+
+def perturb_line_parameters(frac=0.05):
+    p = lambda x: x * (1.0 + rng.uniform(-frac, frac))
+    return {"R1": p(R1_NOM), "X1": p(X1_NOM), "C1": p(C1_NOM),
+            "R0": p(R0_NOM), "X0": p(X0_NOM), "C0": p(C0_NOM)}
+
+def sample_line_parameters():
+    return {name: perturb_line_parameters() for name in LINE_LENGTHS}
+
+def sample_load():
+    scale = float(rng.choice([0.5, 0.75, 1.0, 1.25, 1.5]))
+    pf    = float(rng.uniform(0.85, 1.0))
+    P = B3_P_MW * scale
+    Q = P * np.tan(np.arccos(pf))
+    return P, Q
+
+def sample_generators():
+    """Randomly varies the strength (SSC) and X/R ratio of both generators."""
+    # Generator 1: Stronger, varies from 1000 MVA to 10000 MVA
+    G1_SSC = float(rng.uniform(1000.0, 10000.0))
+    G1_XR  = float(rng.uniform(5.0, 15.0))
+    
+    # Generator 2: Slightly weaker, varies from 800 MVA to 8000 MVA
+    G2_SSC = float(rng.uniform(800.0, 8000.0))
+    G2_XR  = float(rng.uniform(4.0, 12.0))
+    
+    return {
+        "G1_SSC": G1_SSC, "G1_XR": G1_XR,
+        "G2_SSC": G2_SSC, "G2_XR": G2_XR
+    }
+# 12. IMPEDANCES
+
+def line_impedance(length_km, params):
+    z1 = (params["R1"] + 1j * params["X1"]) * length_km
+    z0 = (params["R0"] + 1j * params["X0"]) * length_km
+    return z1, z0
+
+def phase_impedance(length_km, params):
+    z1, z0 = line_impedance(length_km, params)
+    Z_seq = np.diag([z0, z1, z1])
+    return SEQ_TO_PHASE @ Z_seq @ PHASE_TO_SEQ
+
+def generator_impedance(ssc_mva, xr):
+    z = BASE_VOLTAGE_V**2 / (ssc_mva * 1e6)
+    R = z / np.sqrt(1.0 + xr**2)
+    X = R * xr
+    return R + 1j * X
+
+def balanced_source(angle_deg):
+    ang = np.deg2rad(angle_deg)
+    ph  = np.array([0.0, -2.0*np.pi/3.0, 2.0*np.pi/3.0])
+    return V_PHASE * np.exp(1j * (ang + ph))
+
+def calculate_load_impedance(P_MW, Q_MVAR):
+    S_phase = (P_MW * 1e6 + 1j * Q_MVAR * 1e6) / 3.0
+    return V_PHASE**2 / np.conj(S_phase)
+
+# 13. FAULT CONDUCTANCE
+
+def fault_conductance_matrix(fault_type, Rf):
+    G = np.zeros((3, 3), dtype=complex)
+    g = 1.0 / Rf
+    if fault_type == "LG":
+        G[0, 0] = g
+    elif fault_type == "LL":
+        G[0, 0] += g; G[1, 1] += g; G[0, 1] -= g; G[1, 0] -= g
+    elif fault_type == "LLG":
+        G[0, 0] = g; G[1, 1] = g
+    elif fault_type == "LLL":
+        G[0, 0] += g; G[1, 1] += g; G[0, 1] -= g; G[1, 0] -= g
+        G[1, 1] += g; G[2, 2] += g; G[1, 2] -= g; G[2, 1] -= g
+        G[2, 2] += g; G[0, 0] += g; G[2, 0] -= g; G[0, 2] -= g
+    elif fault_type == "LLLG":
+        G[0, 0] = g; G[1, 1] = g; G[2, 2] = g
+    else:
+        raise ValueError(f"Unknown fault type: {fault_type}")
+    return G
+
+# 14. SOLVE NETWORK
+
+def solve_network(line_params, P_load, Q_load, gen_params,
+                  faulted_line=None, fault_location=None,
+                  fault_type=None, Rf=None):
+    has_fault = faulted_line is not None
+    buses = ["B1", "B2", "B3"] + (["FAULT"] if has_fault else [])
+    bus_index = {b: i for i, b in enumerate(buses)}
+    n = 3 * len(buses)
+    Y = np.zeros((n, n), dtype=complex)
+    I_rhs = np.zeros(n, dtype=complex)
+
+    def idx(bus):
+        i = bus_index[bus]
+        return slice(3*i, 3*i+3)
+
+    def add_branch(ba, bb, length_km, params):
+        Yb = np.linalg.inv(phase_impedance(length_km, params))
+        ia, ib = idx(ba), idx(bb)
+        Y[ia, ia] += Yb; Y[ib, ib] += Yb
+        Y[ia, ib] -= Yb; Y[ib, ia] -= Yb
+
+    for ln, (ba, bb) in LINE_CONNECTIONS.items():
+        L = LINE_LENGTHS[ln]
+        params = line_params[ln]
+        if has_fault and ln == faulted_line:
+            f = fault_location / 100.0
+            add_branch(ba, "FAULT", L * f, params)
+            add_branch("FAULT", bb, L * (1.0 - f), params)
+        else:
+            add_branch(ba, bb, L, params)
+
+    # Use sampled generator parameters
+    Zg1 = generator_impedance(gen_params["G1_SSC"], gen_params["G1_XR"])
+    Yg1 = np.eye(3, dtype=complex) / Zg1
+    i1 = idx("B1"); Y[i1, i1] += Yg1; I_rhs[i1] += Yg1 @ balanced_source(G1_ANGLE_DEG)
+
+    Zg2 = generator_impedance(gen_params["G2_SSC"], gen_params["G2_XR"])
+    Yg2 = np.eye(3, dtype=complex) / Zg2
+    i2 = idx("B2"); Y[i2, i2] += Yg2; I_rhs[i2] += Yg2 @ balanced_source(G2_ANGLE_DEG)
+
+    Yload = np.eye(3, dtype=complex) / calculate_load_impedance(P_load, Q_load)
+    i3 = idx("B3"); Y[i3, i3] += Yload
+
+    if has_fault:
+        Gf = fault_conductance_matrix(fault_type, Rf)
+        ifault = idx("FAULT"); Y[ifault, ifault] += Gf
+
+    V = np.linalg.solve(Y, I_rhs)
+    return {b: V[idx(b)] for b in buses}
+
+
+# 15. LINE CURRENT (with per-case params)
+
+def line_current(V_from, V_to, length_km, params):
+    return np.linalg.solve(phase_impedance(length_km, params), V_from - V_to)
+
+# 16. EXTRACT MEASUREMENTS (two-ended)
+
+def extract_measurements(voltages, line_params,
+                         faulted_line=None, fault_location=None):
+    m = {}
+    for bus in ["B1", "B2", "B3"]:
+        V = voltages[bus]
+        m[f"{bus}_Va"] = V[0]; m[f"{bus}_Vb"] = V[1]; m[f"{bus}_Vc"] = V[2]
+
+    for ln, (ba, bb) in LINE_CONNECTIONS.items():
+        L = LINE_LENGTHS[ln]; params = line_params[ln]
+        V_send, V_recv = voltages[ba], voltages[bb]
+        if ln == faulted_line:
+            f = fault_location / 100.0
+            I_send = line_current(V_send, voltages["FAULT"], L * f, params)
+            I_recv = line_current(V_recv, voltages["FAULT"], L * (1.0 - f), params)
+        else:
+            I_send = line_current(V_send, V_recv, L, params)
+            I_recv = -I_send
+
+        for ph, k in zip(range(3), "abc"):
+            m[f"{ln}_V_send_{k}"] = V_send[ph]
+            m[f"{ln}_V_recv_{k}"] = V_recv[ph]
+            m[f"{ln}_I_send_{k}"] = I_send[ph]
+            m[f"{ln}_I_recv_{k}"] = I_recv[ph]
+    return m
+
+
+# 17. WAVEFORMS
+
+def phasor_to_waveform(fault_time, pre, post):
+    w_pre  = np.sqrt(2.0) * np.real(pre  * np.exp(1j * OMEGA * TIME))
+    w_post = np.sqrt(2.0) * np.real(post * np.exp(1j * OMEGA * TIME))
+    return np.where(TIME < fault_time, w_pre, w_post)
+
+def create_case_waveforms(pre_m, post_m, fault_time):
+    data = {"time": TIME}
+    for bus in ["B1", "B2", "B3"]:
+        for k in "abc":
+            key = f"{bus}_V{k}"
+            data[key] = phasor_to_waveform(fault_time, pre_m[key], post_m[key])
+    for ln in LINE_LENGTHS:
+        for side in ["send", "recv"]:
+            for q in ["V", "I"]:
+                for k in "abc":
+                    key = f"{ln}_{q}_{side}_{k}"
+                    data[key] = phasor_to_waveform(fault_time, pre_m[key], post_m[key])
+    return data
+
+
+# 18. BUILD PER-LINE ROWS (With Pre/Post and Delta Features)
+
+
+def build_per_line_rows(case_id, line_params, pre_m, post_m,
+                        Rf, inception_angle_deg,
+                        faulted_line, fault_type, fault_location_pct):
+
+    rows = []
+    for ln in LINE_LENGTHS:
+        params = line_params[ln]
+        L = LINE_LENGTHS[ln]
+
+        # Post-fault arrays
+        V_send_post = np.array([post_m[f"{ln}_V_send_{k}"] for k in "abc"])
+        V_recv_post = np.array([post_m[f"{ln}_V_recv_{k}"] for k in "abc"])
+        I_send_post = np.array([post_m[f"{ln}_I_send_{k}"] for k in "abc"])
+        I_recv_post = np.array([post_m[f"{ln}_I_recv_{k}"] for k in "abc"])
+
+        # Pre-fault arrays
+        V_send_pre = np.array([pre_m[f"{ln}_V_send_{k}"] for k in "abc"])
+        V_recv_pre = np.array([pre_m[f"{ln}_V_recv_{k}"] for k in "abc"])
+        I_send_pre = np.array([pre_m[f"{ln}_I_send_{k}"] for k in "abc"])
+        I_recv_pre = np.array([pre_m[f"{ln}_I_recv_{k}"] for k in "abc"])
+
+        # Deltas (Post - Pre) for ABC phases
+        dV_send = V_send_post - V_send_pre
+        dV_recv = V_recv_post - V_recv_pre
+        dI_send = I_send_post - I_send_pre
+        dI_recv = I_recv_post - I_recv_pre
+
+        # Sequence components (Post)
+        V_send_seq_post = abc_to_seq(V_send_post)
+        V_recv_seq_post = abc_to_seq(V_recv_post)
+        I_send_seq_post = abc_to_seq(I_send_post)
+        I_recv_seq_post = abc_to_seq(I_recv_post)
+
+        # Sequence components (Pre)
+        V_send_seq_pre = abc_to_seq(V_send_pre)
+        V_recv_seq_pre = abc_to_seq(V_recv_pre)
+        I_send_seq_pre = abc_to_seq(I_send_pre)
+        I_recv_seq_pre = abc_to_seq(I_recv_pre)
+
+        # Sequence Deltas
+        dV_send_seq = V_send_seq_post - V_send_seq_pre
+        dV_recv_seq = V_recv_seq_post - V_recv_seq_pre
+        dI_send_seq = I_send_seq_post - I_send_seq_pre
+        dI_recv_seq = I_recv_seq_post - I_recv_seq_pre
+
+        row = {
+            "Case_ID": case_id,
+            "Line_Name": ln,
+
+            "R1_pu": params["R1"] * L / Z_BASE,
+            "X1_pu": params["X1"] * L / Z_BASE,
+            "C1_pu": params["C1"] * 1e-6 * OMEGA * Z_BASE * L,
+            "R0_pu": params["R0"] * L / Z_BASE,
+            "X0_pu": params["X0"] * L / Z_BASE,
+            "C0_pu": params["C0"] * 1e-6 * OMEGA * Z_BASE * L,
+            "Length_km": L,
+
+            "Rf_pu": (Rf / Z_BASE) if (faulted_line == ln) else 0.0,
+            "Inception_Angle_deg": inception_angle_deg,
+        }
+
+        # ABC phasors (mag + angle, per-unit) - Post and Delta
+        for ph_idx, k in enumerate("abc"):
+            # Post
+            row[f"V_send_{k}_mag"] = abs(V_send_post[ph_idx]) / V_BASE_PHASE
+            row[f"V_send_{k}_ang"] = np.angle(V_send_post[ph_idx])
+            row[f"V_recv_{k}_mag"] = abs(V_recv_post[ph_idx]) / V_BASE_PHASE
+            row[f"V_recv_{k}_ang"] = np.angle(V_recv_post[ph_idx])
+            row[f"I_send_{k}_mag"] = abs(I_send_post[ph_idx]) / I_BASE
+            row[f"I_send_{k}_ang"] = np.angle(I_send_post[ph_idx])
+            row[f"I_recv_{k}_mag"] = abs(I_recv_post[ph_idx]) / I_BASE
+            row[f"I_recv_{k}_ang"] = np.angle(I_recv_post[ph_idx])
+
+            # Delta
+            row[f"dV_send_{k}_mag"] = abs(dV_send[ph_idx]) / V_BASE_PHASE
+            row[f"dV_send_{k}_ang"] = np.angle(dV_send[ph_idx])
+            row[f"dV_recv_{k}_mag"] = abs(dV_recv[ph_idx]) / V_BASE_PHASE
+            row[f"dV_recv_{k}_ang"] = np.angle(dV_recv[ph_idx])
+            row[f"dI_send_{k}_mag"] = abs(dI_send[ph_idx]) / I_BASE
+            row[f"dI_send_{k}_ang"] = np.angle(dI_send[ph_idx])
+            row[f"dI_recv_{k}_mag"] = abs(dI_recv[ph_idx]) / I_BASE
+            row[f"dI_recv_{k}_ang"] = np.angle(dI_recv[ph_idx])
+
+        # Sequence components (Post and Delta): [V0, V1, V2]
+        for prefix, seq_post, seq_delta, base in [
+            ("V_send", V_send_seq_post, dV_send_seq, V_BASE_PHASE),
+            ("V_recv", V_recv_seq_post, dV_recv_seq, V_BASE_PHASE),
+            ("I_send", I_send_seq_post, dI_send_seq, I_BASE),
+            ("I_recv", I_recv_seq_post, dI_recv_seq, I_BASE),
+        ]:
+            V0, V1, V2 = seq_post
+            row[f"V1_{prefix}_mag"] = abs(V1) / base
+            row[f"V1_{prefix}_ang"] = np.angle(V1)
+            row[f"V2_{prefix}_mag"] = abs(V2) / base
+            row[f"V2_{prefix}_ang"] = np.angle(V2)
+            row[f"V0_{prefix}_mag"] = abs(V0) / base
+            row[f"V0_{prefix}_ang"] = np.angle(V0)
+
+            V0_d, V1_d, V2_d = seq_delta
+            row[f"dV1_{prefix}_mag"] = abs(V1_d) / base
+            row[f"dV1_{prefix}_ang"] = np.angle(V1_d)
+            row[f"dV2_{prefix}_mag"] = abs(V2_d) / base
+            row[f"dV2_{prefix}_ang"] = np.angle(V2_d)
+            row[f"dV0_{prefix}_mag"] = abs(V0_d) / base
+            row[f"dV0_{prefix}_ang"] = np.angle(V0_d)
+
+        # Labels
+        if faulted_line is None:
+            row["is_faulted"] = 0
+            row["fault_type"]  = "None"
+            row["location_percent"] = np.nan
+        elif ln == faulted_line:
+            row["is_faulted"] = 1
+            row["fault_type"]  = fault_type
+            row["location_percent"] = fault_location_pct
+        else:
+            row["is_faulted"] = 0
+            row["fault_type"]  = "None"
+            row["location_percent"] = np.nan
+
+        rows.append(row)
+    return rows
+
+# 19. GENERATE ONE CASE
+
+def generate_faulted_case(case_id, line_name, fault_type):
+    line_params = sample_line_parameters()
+    gen_params = sample_generators()  # <-- NEW: Sample generators
+    P, Q = sample_load()
+
+    location_pct    = float(rng.uniform(5.0, 95.0))
+    Rf              = float(rng.uniform(0.1, 100.0))
+    inception_angle = float(rng.uniform(0.0, 360.0))
+    fault_time      = PREFAULT_TIME + inception_angle / (360.0 * FREQUENCY)
+
+    pre_v = solve_network(line_params, P, Q, gen_params)
+    pre_m = extract_measurements(pre_v, line_params)
+
+    post_v = solve_network(line_params, P, Q, gen_params,
+                           faulted_line=line_name,
+                           fault_location=location_pct,
+                           fault_type=fault_type, Rf=Rf)
+    post_m = extract_measurements(post_v, line_params,
+                                  faulted_line=line_name,
+                                  fault_location=location_pct)
+
+    wf   = create_case_waveforms(pre_m, post_m, fault_time)
+    rows = build_per_line_rows(case_id, line_params, pre_m, post_m,
+                               Rf, inception_angle,
+                               faulted_line=line_name,
+                               fault_type=fault_type,
+                               fault_location_pct=location_pct)
+    return wf, rows, fault_time, location_pct, Rf, inception_angle
+
+
+def generate_nofault_case(case_id):
+    line_params = sample_line_parameters()
+    gen_params = sample_generators()  # <-- NEW: Sample generators
+    P, Q = sample_load()
+
+    fault_time = PREFAULT_TIME
+    v = solve_network(line_params, P, Q, gen_params)
+    m = extract_measurements(v, line_params)
+
+    wf   = create_case_waveforms(m, m, fault_time)   # pre == post
+    rows = build_per_line_rows(case_id, line_params, m, m,
+                               Rf=None, inception_angle_deg=0.0,
+                               faulted_line=None,
+                               fault_type=None,
+                               fault_location_pct=None)
+    return wf, rows
+
+
+# 20. PLOTTING FUNCTION
+
+def plot_fault_case(data):
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 2)
+    
+    wf = data["wf"]
+    time = wf["time"]
+    fault_time = data["fault_time"]
+    
+    # B1 Voltage
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(time, wf["B1_Va"], label="Va")
+    ax1.plot(time, wf["B1_Vb"], label="Vb")
+    ax1.plot(time, wf["B1_Vc"], label="Vc")
+    ax1.axvline(fault_time, color='k', linestyle='--')
+    ax1.set_title("B1 Voltage")
+    ax1.set_ylabel("Voltage (V)")
+    ax1.legend()
+    ax1.grid(True)
+    
+    # B2 Voltage
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(time, wf["B2_Va"], label="Va")
+    ax2.plot(time, wf["B2_Vb"], label="Vb")
+    ax2.plot(time, wf["B2_Vc"], label="Vc")
+    ax2.axvline(fault_time, color='k', linestyle='--')
+    ax2.set_title("B2 Voltage")
+    ax2.set_ylabel("Voltage (V)")
+    ax2.legend()
+    ax2.grid(True)
+    
+    # B3 Voltage
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(time, wf["B3_Va"], label="Va")
+    ax3.plot(time, wf["B3_Vb"], label="Vb")
+    ax3.plot(time, wf["B3_Vc"], label="Vc")
+    ax3.axvline(fault_time, color='k', linestyle='--')
+    ax3.set_title("B3 Voltage")
+    ax3.set_ylabel("Voltage (V)")
+    ax3.legend()
+    ax3.grid(True)
+    
+    # TL Currents (Phase A)
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.plot(time, wf["TL1_I_send_a"], label="TL1 Ia")
+    ax4.plot(time, wf["TL2_I_send_a"], label="TL2 Ia")
+    ax4.plot(time, wf["TL3_I_send_a"], label="TL3 Ia")
+    ax4.axvline(fault_time, color='k', linestyle='--')
+    ax4.set_title("Transmission-Line Phase-A Currents")
+    ax4.set_ylabel("Current (A)")
+    ax4.legend()
+    ax4.grid(True)
+    ax4.set_xlabel("Time (s)")
+    
+    # Text Info
+    ax5 = fig.add_subplot(gs[2, :])
+    ax5.axis('off')
+    text_str = (
+        f"Case: {data['case_id']}\n"
+        f"Faulted line: {data['faulted_line']}\n"
+        f"Fault type: {data['fault_type']}\n"
+        f"Location: {data['location_pct']:.2f}%\n"
+        f"Rf: {data['Rf']:.4f} Ω\n"
+        f"Inception angle: {data['inception_angle']:.2f}°\n"
+        f"Fault time: {fault_time:.6f} s"
+    )
+    ax5.text(0.5, 0.5, text_str, transform=ax5.transAxes, fontsize=14,
+             verticalalignment='center', horizontalalignment='center',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+             
+    plt.tight_layout()
+    plot_path = os.path.join(OUTPUT_DIR, f"fault_plot_{data['fault_type']}.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"  Saved plot: {plot_path}")
+
+# 21. MAIN
+
+def generate_dataset():
+    cases_per_fault = TEST_CASES if TEST_MODE else N_CASES_PER_FAULT
+    n_nofault       = (TEST_CASES * 3) if TEST_MODE else N_NOFAULT_CASES
+
+    total_faulted = len(LINE_LENGTHS) * len(FAULT_TYPES) * cases_per_fault
+    total_all     = total_faulted + n_nofault
+
+    print("=" * 70)
+    print("FAULT DATASET GENERATOR (per-line, two-ended, per-unit)")
+    print("=" * 70)
+    print(f"Faulted cases: {total_faulted}")
+    print(f"No-fault cases: {n_nofault}")
+    print(f"Total cases: {total_all}")
+    print(f"Expected Excel rows: {total_all * 3}")
+    print("=" * 70)
+
+    all_rows = []
+    case_number = 1
+    plot_cases = {}
+
+    for line_name in LINE_LENGTHS:
+        for fault_type in FAULT_TYPES:
+            print(f"\nFaulted: line={line_name}, type={fault_type}")
+            for i in range(cases_per_fault):
+                case_id = f"Case_{case_number:05d}"
+                wf, rows, f_time, loc_pct, Rf, inc_ang = generate_faulted_case(case_id, line_name, fault_type)
+                
+                # Store the first case of each fault type for plotting
+                if fault_type not in plot_cases:
+                    plot_cases[fault_type] = {
+                        "case_id": case_id,
+                        "faulted_line": line_name,
+                        "fault_type": fault_type,
+                        "wf": wf,
+                        "fault_time": f_time,
+                        "location_pct": loc_pct,
+                        "Rf": Rf,
+                        "inception_angle": inc_ang
+                    }
+
+                all_rows.extend(rows)
+                if i == 0 or (i + 1) % 50 == 0 or i == cases_per_fault - 1:
+                    print(f"  {i+1}/{cases_per_fault}")
+                case_number += 1
+
+    print(f"\nNo-fault cases: {n_nofault}")
+    for i in range(n_nofault):
+        case_id = f"Case_{case_number:05d}"
+        _, rows = generate_nofault_case(case_id)
+        all_rows.extend(rows)
+        if i == 0 or (i + 1) % 500 == 0 or i == n_nofault - 1:
+            print(f"  {i+1}/{n_nofault}")
+        case_number += 1
+
+    # Generate and save the 5 plots
+    print("\nGenerating visualization plots...")
+    for fault_type, data in plot_cases.items():
+        plot_fault_case(data)
+
+    df = pd.DataFrame(all_rows)
+    excel_path = os.path.join(OUTPUT_DIR, "fault_dataset.xlsx")
+    print(f"\nSaving Excel ({len(df)} rows)...")
+    df.to_excel(excel_path, index=False)
+
+    print("\n" + "=" * 70)
+    print("DONE")
+    print("=" * 70)
+    print(f"Cases: {case_number - 1}")
+    print(f"Rows:  {len(df)}")
+    print(f"Excel: {excel_path}")
+    print(f"\nFault type distribution:")
+    print(df["fault_type"].value_counts())
+    print(f"\nis_faulted distribution:")
+    print(df["is_faulted"].value_counts())
+
+    return df
+
+
+if __name__ == "__main__":
+    generate_dataset()
