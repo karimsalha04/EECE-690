@@ -1,5 +1,6 @@
 # EECE-690
-# baseline code using the phase quantities 
+# baseline code using the phase quantities
+# same is applied to the other features (sequence, delta phase, and delta sequence)
 # sweeping to find best L2 regularization coeffecient
 # plotting training vs. validation loss to choose the right number of iterations and prevent overfitting 
 import os
